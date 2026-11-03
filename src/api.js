@@ -10,6 +10,8 @@ import {
   setWalletHold,
   createWithdrawRequest,
   getWithdrawals,
+  getStreakInfo,
+  claimStreak,
 } from './users.js';
 
 function userPayload(user, refs) {
@@ -19,6 +21,8 @@ function userPayload(user, refs) {
   for (const l of levels) {
     if (hold >= l.hold) current = l;
   }
+
+  const streak = getStreakInfo(user);
 
   return {
     id: user.id,
@@ -39,6 +43,12 @@ function userPayload(user, refs) {
       count: refs?.count || 0,
       earned: refs?.earned || 0,
     },
+    // Streak info
+    streak_count: streak.streak_count,
+    claimed_today: streak.claimed_today,
+    next_reward: streak.next_reward,
+    next_day: streak.next_day,
+    total_streak_claimed: streak.total_claimed,
   };
 }
 
@@ -118,7 +128,7 @@ export function createApi() {
     }
   });
 
-  // Обновить холд (пока вручную / после on-chain проверки)
+  // Обновить холд
   app.post('/api/wallet/hold', async (req, res) => {
     try {
       const { user_id, hold } = req.body;
@@ -155,6 +165,39 @@ export function createApi() {
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: err.message || 'Server error' });
+    }
+  });
+
+  // ===== DAILY STREAK =====
+
+  // Получить информацию о стрике
+  app.get('/api/streak/:id', async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!id) return res.status(400).json({ error: 'Invalid id' });
+
+      const user = await getUser(id);
+      if (!user) return res.status(404).json({ error: 'User not found' });
+
+      const info = getStreakInfo(user);
+      res.json(info);
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Забрать награду стрика
+  app.post('/api/streak/claim', async (req, res) => {
+    try {
+      const { user_id } = req.body;
+      if (!user_id) return res.status(400).json({ error: 'user_id required' });
+
+      const result = await claimStreak(Number(user_id));
+      res.json(result);
+    } catch (err) {
+      console.error(err);
+      res.status(400).json({ error: err.message });
     }
   });
 
