@@ -19,55 +19,77 @@ function getLevelInfo(walletHold) {
   return lvl;
 }
 
-/**
- * Серверный майнинг 24/7.
- * Считает elapsed time с last_mining_at и доначисляет pending.
- */
-async function accrueMining(user) {
-  if (!user || !user.id) return user;
-
-  const now = new Date();
+function calcEarned(user, now = new Date()) {
   let last;
-  if (user.last_mining_at) {
-    last = new Date(user.last_mining_at);
-  } else if (user.created_at) {
-    last = new Date(user.created_at);
-  } else {
-    last = now;
-  }
+  if (user.last_mining_at) last = new Date(user.last_mining_at);
+  else if (user.created_at) last = new Date(user.created_at);
+  else last = now;
 
   const seconds = Math.max(0, (now.getTime() - last.getTime()) / 1000);
-
-  // Минимум 2 секунды, чтобы не спамить БД
-  if (seconds < 2) {
-    return user;
+  if (seconds < 1) {
+    return { earned: 0, seconds, newPending: Number(user.pending || 0) };
   }
 
   const lvl = getLevelInfo(user.wallet_hold);
   const earned = (lvl.rate / 3600) * seconds * lvl.boost;
-  const newPending = Number(user.pending || 0) + earned;
+  return {
+    earned,
+    seconds,
+    newPending: Number(user.pending || 0) + earned,
+    rate: lvl.rate,
+    boost: lvl.boost,
+    level: lvl.level,
+  };
+}
+
+/** Один UPDATE: доначисление + опционально профиль */
+async function accrueAndTouch(user, profile = null) {
+  if (!user?.id) return user;
+
+  const now = new Date();
+  const calc = calcEarned(user, now);
+
+  // Если прошло < 1с и профиль не меняем — ничего не пишем
+  const needProfile = profile && (
+    profile.username !== user.username ||
+    profile.first_name !== user.first_name ||
+    profile.last_name !== user.last_name
+  );
+
+  if (calc.seconds < 1 && !needProfile) {
+    return user;
+  }
+
+  const patch = {
+    updated_at: now.toISOString(),
+  };
+
+  if (calc.seconds >= 1) {
+    patch.pending = calc.newPending;
+    patch.last_mining_at = now.toISOString();
+  }
+
+  if (needProfile) {
+    patch.username = profile.username || null;
+    patch.first_name = profile.first_name || null;
+    patch.last_name = profile.last_name || null;
+  }
 
   const { data, error } = await supabase
     .from('users')
-    .update({
-      pending: newPending,
-      last_mining_at: now.toISOString(),
-      updated_at: now.toISOString(),
-    })
+    .update(patch)
     .eq('id', user.id)
     .select('*')
     .single();
 
   if (error) {
-    console.error('accrueMining error:', error.message || error);
-    // Возвращаем хотя бы локально посчитанное, чтобы UI не врал
+    console.error('accrueAndTouch error:', error.message || error);
     return {
       ...user,
-      pending: newPending,
+      pending: calc.newPending,
       last_mining_at: now.toISOString(),
     };
   }
-
   return data;
 }
 
@@ -81,39 +103,14 @@ export async function upsertUser(tgUser, startParam = null) {
     .eq('id', id)
     .maybeSingle();
 
-  if (findErr) {
-    console.error('find user error:', findErr);
-    throw findErr;
-  }
+  if (findErr) throw findErr;
 
   if (existing) {
-    // 1) Доначисляем майнинг
-    let user = await accrueMining(existing);
-
-    // 2) Обновляем профиль (не трогаем pending)
-    const { data, error } = await supabase
-      .from('users')
-      .update({
-        username: tgUser.username || null,
-        first_name: tgUser.first_name || null,
-        last_name: tgUser.last_name || null,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', id)
-      .select('*')
-      .single();
-
-    if (error) {
-      console.error('update profile error:', error);
-      return user;
-    }
-
-    // Берём pending из accrued (на случай если select вернул старое)
-    return {
-      ...data,
-      pending: user.pending,
-      last_mining_at: user.last_mining_at,
-    };
+    return await accrueAndTouch(existing, {
+      username: tgUser.username || null,
+      first_name: tgUser.first_name || null,
+      last_name: tgUser.last_name || null,
+    });
   }
 
   // Новый пользователь
@@ -150,10 +147,7 @@ export async function upsertUser(tgUser, startParam = null) {
     .select('*')
     .single();
 
-  if (error) {
-    console.error('insert user error:', error);
-    throw error;
-  }
+  if (error) throw error;
   return data;
 }
 
@@ -167,40 +161,52 @@ export async function getUser(id) {
   if (error) throw error;
   if (!data) return null;
 
-  return await accrueMining(data);
+  return await accrueAndTouch(data);
 }
 
 export async function getReferralStats(userId) {
-  const { count } = await supabase
-    .from('users')
-    .select('*', { count: 'exact', head: true })
-    .eq('referrer_id', userId);
+  const [countRes, earningsRes] = await Promise.all([
+    supabase
+      .from('users')
+      .select('*', { count: 'exact', head: true })
+      .eq('referrer_id', userId),
+    supabase
+      .from('referral_earnings')
+      .select('amount')
+      .eq('user_id', userId),
+  ]);
 
-  const { data: earnings } = await supabase
-    .from('referral_earnings')
-    .select('amount')
-    .eq('user_id', userId);
-
-  const totalEarned = (earnings || []).reduce((sum, e) => sum + Number(e.amount), 0);
+  const totalEarned = (earningsRes.data || []).reduce(
+    (sum, e) => sum + Number(e.amount),
+    0
+  );
 
   return {
-    count: count || 0,
+    count: countRes.count || 0,
     earned: totalEarned,
   };
 }
 
 export async function claimRewards(userId) {
-  // Сначала доначисляем всё, что намайнилось
-  let user = await getUser(userId);
+  const { data: user, error: findErr } = await supabase
+    .from('users')
+    .select('*')
+    .eq('id', userId)
+    .maybeSingle();
+
+  if (findErr) throw findErr;
   if (!user) throw new Error('User not found');
 
-  const pending = Number(user.pending) || 0;
+  const now = new Date();
+  const calc = calcEarned(user, now);
+  const pending = calc.newPending;
+
   if (pending < 0.0001) {
     return { claimed: 0, newBalance: Number(user.app_balance) || 0 };
   }
 
   const newBalance = Number(user.app_balance || 0) + pending;
-  const now = new Date().toISOString();
+  const iso = now.toISOString();
 
   const { error } = await supabase
     .from('users')
@@ -208,38 +214,41 @@ export async function claimRewards(userId) {
       app_balance: newBalance,
       pending: 0,
       total_claimed: Number(user.total_claimed || 0) + pending,
-      last_mining_at: now,
-      updated_at: now,
+      last_mining_at: iso,
+      updated_at: iso,
     })
     .eq('id', userId);
 
   if (error) throw error;
 
-  // 5% рефереру
+  // Реф 5% — не блокируем ответ
   if (user.referrer_id) {
     const bonus = pending * 0.05;
+    Promise.resolve()
+      .then(async () => {
+        const { data: referrer } = await supabase
+          .from('users')
+          .select('app_balance')
+          .eq('id', user.referrer_id)
+          .maybeSingle();
 
-    const { data: referrer } = await supabase
-      .from('users')
-      .select('app_balance')
-      .eq('id', user.referrer_id)
-      .maybeSingle();
+        if (!referrer) return;
 
-    if (referrer) {
-      await supabase
-        .from('users')
-        .update({
-          app_balance: Number(referrer.app_balance || 0) + bonus,
-          updated_at: now,
-        })
-        .eq('id', user.referrer_id);
+        await supabase
+          .from('users')
+          .update({
+            app_balance: Number(referrer.app_balance || 0) + bonus,
+            updated_at: iso,
+          })
+          .eq('id', user.referrer_id);
 
-      await supabase.from('referral_earnings').insert({
-        user_id: user.referrer_id,
-        from_user_id: userId,
-        amount: bonus,
-      });
-    }
+        await supabase.from('referral_earnings').insert({
+          user_id: user.referrer_id,
+          from_user_id: userId,
+          amount: bonus,
+        });
+      })
+      .catch((e) => console.error('ref bonus error', e));
   }
 
   return { claimed: pending, newBalance };

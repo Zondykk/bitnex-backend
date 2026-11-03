@@ -11,6 +11,10 @@ export function createApi() {
     res.json({ status: 'ok', service: 'BitneX API' });
   });
 
+  app.get('/health', (req, res) => {
+    res.json({ ok: true, ts: Date.now() });
+  });
+
   // Получить пользователя (с доначислением майнинга)
   app.get('/api/user/:id', async (req, res) => {
     try {
