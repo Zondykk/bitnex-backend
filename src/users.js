@@ -11,6 +11,9 @@ const LEVELS = [
   { level: 8, hold: 40000, rate: 200, boost: 10.0 },
 ];
 
+const BTX_MASTER = 'EQA7OlHxE5Vag1Js8-mZEhx4BlfcfTP6UYbohMuQi5VfmILX';
+const BTX_MASTER_RAW = '0:3b3a51f113955a83526cf3e999121c780657dc7d33fa5186e884cb908b955f98';
+
 function getLevelInfo(walletHold) {
   let lvl = LEVELS[0];
   for (const l of LEVELS) {
@@ -42,6 +45,34 @@ function calcEarned(user, now = new Date()) {
   };
 }
 
+/** Получаем реальный баланс BTX с блокчейна */
+async function fetchBtxBalance(walletAddress) {
+  if (!walletAddress) return 0;
+
+  try {
+    const url = `https://tonapi.io/v2/accounts/${walletAddress}/jettons`;
+    const res = await fetch(url);
+    if (!res.ok) return 0;
+
+    const data = await res.json();
+    const jettons = data.balances || [];
+
+    const btx = jettons.find(j => {
+      const addr = j.jetton?.address || '';
+      return addr === BTX_MASTER || addr === BTX_MASTER_RAW;
+    });
+
+    if (!btx) return 0;
+
+    // decimals = 9
+    const raw = Number(btx.balance || 0);
+    return raw / 1e9;
+  } catch (err) {
+    console.error('fetchBtxBalance error:', err.message);
+    return 0;
+  }
+}
+
 /** Один UPDATE: доначисление + опционально профиль */
 async function accrueAndTouch(user, profile = null) {
   if (!user?.id) return user;
@@ -49,7 +80,6 @@ async function accrueAndTouch(user, profile = null) {
   const now = new Date();
   const calc = calcEarned(user, now);
 
-  // Если прошло < 1с и профиль не меняем — ничего не пишем
   const needProfile = profile && (
     profile.username !== user.username ||
     profile.first_name !== user.first_name ||
@@ -161,6 +191,21 @@ export async function getUser(id) {
   if (error) throw error;
   if (!data) return null;
 
+  // Если кошелёк подключён — обновляем реальный холд
+  if (data.wallet_address) {
+    const hold = await fetchBtxBalance(data.wallet_address);
+    if (Math.abs(hold - Number(data.wallet_hold || 0)) > 0.01) {
+      await supabase
+        .from('users')
+        .update({
+          wallet_hold: hold,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', id);
+      data.wallet_hold = hold;
+    }
+  }
+
   return await accrueAndTouch(data);
 }
 
@@ -221,7 +266,7 @@ export async function claimRewards(userId) {
 
   if (error) throw error;
 
-  // Реф 5% — не блокируем ответ
+  // Реф 5%
   if (user.referrer_id) {
     const bonus = pending * 0.05;
     Promise.resolve()
@@ -261,6 +306,7 @@ export function getLevels() {
 export async function connectWallet(userId, walletAddress) {
   if (!userId || !walletAddress) throw new Error('userId and walletAddress required');
 
+  // Сохраняем адрес
   const { data, error } = await supabase
     .from('users')
     .update({
@@ -272,13 +318,31 @@ export async function connectWallet(userId, walletAddress) {
     .single();
 
   if (error) throw error;
-  return data;
+
+  // Сразу проверяем реальный холд
+  const hold = await fetchBtxBalance(walletAddress);
+
+  const { data: updated, error: holdErr } = await supabase
+    .from('users')
+    .update({
+      wallet_hold: hold,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', userId)
+    .select('*')
+    .single();
+
+  if (holdErr) {
+    console.error('set hold error:', holdErr);
+    return data;
+  }
+
+  return updated;
 }
 
 export async function setWalletHold(userId, hold) {
   const value = Math.max(0, Number(hold) || 0);
 
-  // Сначала доначислим майнинг по старому уровню
   const user = await getUser(userId);
   if (!user) throw new Error('User not found');
 
@@ -355,7 +419,7 @@ export async function createWithdrawRequest(userId, amount) {
     .single();
 
   if (error) {
-    // откат баланса при ошибке
+    // откат баланса
     await supabase
       .from('users')
       .update({ app_balance: balance })
