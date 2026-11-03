@@ -257,3 +257,123 @@ export async function claimRewards(userId) {
 export function getLevels() {
   return LEVELS;
 }
+
+export async function connectWallet(userId, walletAddress) {
+  if (!userId || !walletAddress) throw new Error('userId and walletAddress required');
+
+  const { data, error } = await supabase
+    .from('users')
+    .update({
+      wallet_address: walletAddress,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', userId)
+    .select('*')
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+export async function setWalletHold(userId, hold) {
+  const value = Math.max(0, Number(hold) || 0);
+
+  // Сначала доначислим майнинг по старому уровню
+  const user = await getUser(userId);
+  if (!user) throw new Error('User not found');
+
+  const { data, error } = await supabase
+    .from('users')
+    .update({
+      wallet_hold: value,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', userId)
+    .select('*')
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+export async function createWithdrawRequest(userId, amount) {
+  const amt = Number(amount);
+  if (!amt || amt < 10000) throw new Error('Минимум 10 000 BTX');
+
+  const user = await getUser(userId);
+  if (!user) throw new Error('User not found');
+
+  const balance = Number(user.app_balance) || 0;
+  const hold = Number(user.wallet_hold) || 0;
+
+  if (balance < amt) throw new Error('Недостаточно баланса');
+  if (hold < amt * 0.25) throw new Error('Недостаточно холда на кошельке (нужно 25%)');
+  if (!user.wallet_address) throw new Error('Сначала подключите TON-кошелёк');
+
+  // cooldown 24h
+  const { data: last } = await supabase
+    .from('withdrawals')
+    .select('created_at')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (last?.created_at) {
+    const diff = Date.now() - new Date(last.created_at).getTime();
+    if (diff < 24 * 60 * 60 * 1000) {
+      const hoursLeft = Math.ceil((24 * 60 * 60 * 1000 - diff) / 3600000);
+      throw new Error(`Следующая заявка через ~${hoursLeft} ч`);
+    }
+  }
+
+  const fee = amt * 0.05;
+  const net = amt - fee;
+
+  // Списываем баланс
+  const { error: balErr } = await supabase
+    .from('users')
+    .update({
+      app_balance: balance - amt,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', userId);
+
+  if (balErr) throw balErr;
+
+  const { data, error } = await supabase
+    .from('withdrawals')
+    .insert({
+      user_id: userId,
+      amount: amt,
+      fee,
+      net_amount: net,
+      wallet_address: user.wallet_address,
+      status: 'pending',
+    })
+    .select('*')
+    .single();
+
+  if (error) {
+    // откат баланса при ошибке
+    await supabase
+      .from('users')
+      .update({ app_balance: balance })
+      .eq('id', userId);
+    throw error;
+  }
+
+  return data;
+}
+
+export async function getWithdrawals(userId) {
+  const { data, error } = await supabase
+    .from('withdrawals')
+    .select('*')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false })
+    .limit(20);
+
+  if (error) throw error;
+  return data || [];
+}
