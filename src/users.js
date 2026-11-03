@@ -45,7 +45,6 @@ function calcEarned(user, now = new Date()) {
   };
 }
 
-/** Получаем реальный баланс BTX с блокчейна */
 async function fetchBtxBalance(walletAddress) {
   if (!walletAddress) return 0;
 
@@ -63,17 +62,13 @@ async function fetchBtxBalance(walletAddress) {
     });
 
     if (!btx) return 0;
-
-    // decimals = 9
-    const raw = Number(btx.balance || 0);
-    return raw / 1e9;
+    return Number(btx.balance || 0) / 1e9;
   } catch (err) {
     console.error('fetchBtxBalance error:', err.message);
     return 0;
   }
 }
 
-/** Один UPDATE: доначисление + опционально профиль */
 async function accrueAndTouch(user, profile = null) {
   if (!user?.id) return user;
 
@@ -90,9 +85,7 @@ async function accrueAndTouch(user, profile = null) {
     return user;
   }
 
-  const patch = {
-    updated_at: now.toISOString(),
-  };
+  const patch = { updated_at: now.toISOString() };
 
   if (calc.seconds >= 1) {
     patch.pending = calc.newPending;
@@ -143,7 +136,6 @@ export async function upsertUser(tgUser, startParam = null) {
     });
   }
 
-  // Новый пользователь
   let referrerId = null;
   if (startParam) {
     const { data: referrer } = await supabase
@@ -191,7 +183,6 @@ export async function getUser(id) {
   if (error) throw error;
   if (!data) return null;
 
-  // Если кошелёк подключён — обновляем реальный холд
   if (data.wallet_address) {
     const hold = await fetchBtxBalance(data.wallet_address);
     if (Math.abs(hold - Number(data.wallet_hold || 0)) > 0.01) {
@@ -266,7 +257,6 @@ export async function claimRewards(userId) {
 
   if (error) throw error;
 
-  // Реф 5%
   if (user.referrer_id) {
     const bonus = pending * 0.05;
     Promise.resolve()
@@ -306,7 +296,6 @@ export function getLevels() {
 export async function connectWallet(userId, walletAddress) {
   if (!userId || !walletAddress) throw new Error('userId and walletAddress required');
 
-  // Сохраняем адрес
   const { data, error } = await supabase
     .from('users')
     .update({
@@ -319,7 +308,6 @@ export async function connectWallet(userId, walletAddress) {
 
   if (error) throw error;
 
-  // Сразу проверяем реальный холд
   const hold = await fetchBtxBalance(walletAddress);
 
   const { data: updated, error: holdErr } = await supabase
@@ -342,7 +330,6 @@ export async function connectWallet(userId, walletAddress) {
 
 export async function setWalletHold(userId, hold) {
   const value = Math.max(0, Number(hold) || 0);
-
   const user = await getUser(userId);
   if (!user) throw new Error('User not found');
 
@@ -374,7 +361,6 @@ export async function createWithdrawRequest(userId, amount) {
   if (hold < amt * 0.25) throw new Error('Недостаточно холда на кошельке (нужно 25%)');
   if (!user.wallet_address) throw new Error('Сначала подключите TON-кошелёк');
 
-  // cooldown 24h
   const { data: last } = await supabase
     .from('withdrawals')
     .select('created_at')
@@ -394,7 +380,6 @@ export async function createWithdrawRequest(userId, amount) {
   const fee = amt * 0.05;
   const net = amt - fee;
 
-  // Списываем баланс
   const { error: balErr } = await supabase
     .from('users')
     .update({
@@ -419,7 +404,6 @@ export async function createWithdrawRequest(userId, amount) {
     .single();
 
   if (error) {
-    // откат баланса
     await supabase
       .from('users')
       .update({ app_balance: balance })
@@ -440,4 +424,70 @@ export async function getWithdrawals(userId) {
 
   if (error) throw error;
   return data || [];
+}
+
+// ===== АДМИН ФУНКЦИИ =====
+
+export async function getPendingWithdrawals() {
+  const { data, error } = await supabase
+    .from('withdrawals')
+    .select('*, users(id, username, first_name)')
+    .eq('status', 'pending')
+    .order('created_at', { ascending: true });
+
+  if (error) throw error;
+  return data || [];
+}
+
+export async function markWithdrawalPaid(id) {
+  const { data, error } = await supabase
+    .from('withdrawals')
+    .update({ status: 'paid', updated_at: new Date().toISOString() })
+    .eq('id', id)
+    .eq('status', 'pending')
+    .select('*')
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+export async function rejectWithdrawal(id) {
+  // Получаем заявку
+  const { data: w, error: findErr } = await supabase
+    .from('withdrawals')
+    .select('*')
+    .eq('id', id)
+    .eq('status', 'pending')
+    .single();
+
+  if (findErr || !w) throw new Error('Заявка не найдена или уже обработана');
+
+  // Возвращаем баланс
+  const { data: user } = await supabase
+    .from('users')
+    .select('app_balance')
+    .eq('id', w.user_id)
+    .single();
+
+  if (user) {
+    await supabase
+      .from('users')
+      .update({
+        app_balance: Number(user.app_balance || 0) + Number(w.amount),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', w.user_id);
+  }
+
+  // Меняем статус
+  const { data, error } = await supabase
+    .from('withdrawals')
+    .update({ status: 'rejected', updated_at: new Date().toISOString() })
+    .eq('id', id)
+    .select('*')
+    .single();
+
+  if (error) throw error;
+  return data;
 }
