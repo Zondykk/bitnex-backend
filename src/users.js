@@ -11,6 +11,16 @@ const LEVELS = [
   { level: 8, hold: 40000, rate: 200, boost: 10.0 },
 ];
 
+// Награды за стрик (день 1 → день 30)
+const STREAK_REWARDS = [
+  25, 35, 50, 70, 90,           // 1-5
+  110, 130, 160, 190, 220,      // 6-10
+  250, 280, 320, 360, 400,      // 11-15
+  450, 500, 560, 620, 700,      // 16-20
+  780, 860, 950, 1050, 1150,    // 21-25
+  1250, 1400, 1550, 1700, 2000  // 26-30
+];
+
 const BTX_MASTER = 'EQA7OlHxE5Vag1Js8-mZEhx4BlfcfTP6UYbohMuQi5VfmILX';
 const BTX_MASTER_RAW = '0:3b3a51f113955a83526cf3e999121c780657dc7d33fa5186e884cb908b955f98';
 
@@ -47,20 +57,16 @@ function calcEarned(user, now = new Date()) {
 
 async function fetchBtxBalance(walletAddress) {
   if (!walletAddress) return 0;
-
   try {
     const url = `https://tonapi.io/v2/accounts/${walletAddress}/jettons`;
     const res = await fetch(url);
     if (!res.ok) return 0;
-
     const data = await res.json();
     const jettons = data.balances || [];
-
     const btx = jettons.find(j => {
       const addr = j.jetton?.address || '';
       return addr === BTX_MASTER || addr === BTX_MASTER_RAW;
     });
-
     if (!btx) return 0;
     return Number(btx.balance || 0) / 1e9;
   } catch (err) {
@@ -71,7 +77,6 @@ async function fetchBtxBalance(walletAddress) {
 
 async function accrueAndTouch(user, profile = null) {
   if (!user?.id) return user;
-
   const now = new Date();
   const calc = calcEarned(user, now);
 
@@ -81,17 +86,13 @@ async function accrueAndTouch(user, profile = null) {
     profile.last_name !== user.last_name
   );
 
-  if (calc.seconds < 1 && !needProfile) {
-    return user;
-  }
+  if (calc.seconds < 1 && !needProfile) return user;
 
   const patch = { updated_at: now.toISOString() };
-
   if (calc.seconds >= 1) {
     patch.pending = calc.newPending;
     patch.last_mining_at = now.toISOString();
   }
-
   if (needProfile) {
     patch.username = profile.username || null;
     patch.first_name = profile.first_name || null;
@@ -107,13 +108,19 @@ async function accrueAndTouch(user, profile = null) {
 
   if (error) {
     console.error('accrueAndTouch error:', error.message || error);
-    return {
-      ...user,
-      pending: calc.newPending,
-      last_mining_at: now.toISOString(),
-    };
+    return { ...user, pending: calc.newPending, last_mining_at: now.toISOString() };
   }
   return data;
+}
+
+function getTodayDateString() {
+  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+function getYesterdayDateString() {
+  const d = new Date();
+  d.setDate(d.getDate() - 1);
+  return d.toISOString().slice(0, 10);
 }
 
 export async function upsertUser(tgUser, startParam = null) {
@@ -143,14 +150,10 @@ export async function upsertUser(tgUser, startParam = null) {
       .select('id')
       .eq('ref_code', String(startParam))
       .maybeSingle();
-
-    if (referrer && referrer.id !== id) {
-      referrerId = referrer.id;
-    }
+    if (referrer && referrer.id !== id) referrerId = referrer.id;
   }
 
   const now = new Date().toISOString();
-
   const { data, error } = await supabase
     .from('users')
     .insert({
@@ -164,6 +167,9 @@ export async function upsertUser(tgUser, startParam = null) {
       pending: 0,
       total_claimed: 0,
       wallet_hold: 0,
+      streak_count: 0,
+      last_streak_date: null,
+      total_streak_claimed: 0,
       last_mining_at: now,
     })
     .select('*')
@@ -188,10 +194,7 @@ export async function getUser(id) {
     if (Math.abs(hold - Number(data.wallet_hold || 0)) > 0.01) {
       await supabase
         .from('users')
-        .update({
-          wallet_hold: hold,
-          updated_at: new Date().toISOString(),
-        })
+        .update({ wallet_hold: hold, updated_at: new Date().toISOString() })
         .eq('id', id);
       data.wallet_hold = hold;
     }
@@ -202,25 +205,12 @@ export async function getUser(id) {
 
 export async function getReferralStats(userId) {
   const [countRes, earningsRes] = await Promise.all([
-    supabase
-      .from('users')
-      .select('*', { count: 'exact', head: true })
-      .eq('referrer_id', userId),
-    supabase
-      .from('referral_earnings')
-      .select('amount')
-      .eq('user_id', userId),
+    supabase.from('users').select('*', { count: 'exact', head: true }).eq('referrer_id', userId),
+    supabase.from('referral_earnings').select('amount').eq('user_id', userId),
   ]);
 
-  const totalEarned = (earningsRes.data || []).reduce(
-    (sum, e) => sum + Number(e.amount),
-    0
-  );
-
-  return {
-    count: countRes.count || 0,
-    earned: totalEarned,
-  };
+  const totalEarned = (earningsRes.data || []).reduce((sum, e) => sum + Number(e.amount), 0);
+  return { count: countRes.count || 0, earned: totalEarned };
 }
 
 export async function claimRewards(userId) {
@@ -259,31 +249,23 @@ export async function claimRewards(userId) {
 
   if (user.referrer_id) {
     const bonus = pending * 0.05;
-    Promise.resolve()
-      .then(async () => {
-        const { data: referrer } = await supabase
-          .from('users')
-          .select('app_balance')
-          .eq('id', user.referrer_id)
-          .maybeSingle();
-
-        if (!referrer) return;
-
-        await supabase
-          .from('users')
-          .update({
-            app_balance: Number(referrer.app_balance || 0) + bonus,
-            updated_at: iso,
-          })
-          .eq('id', user.referrer_id);
-
-        await supabase.from('referral_earnings').insert({
-          user_id: user.referrer_id,
-          from_user_id: userId,
-          amount: bonus,
-        });
-      })
-      .catch((e) => console.error('ref bonus error', e));
+    Promise.resolve().then(async () => {
+      const { data: referrer } = await supabase
+        .from('users')
+        .select('app_balance')
+        .eq('id', user.referrer_id)
+        .maybeSingle();
+      if (!referrer) return;
+      await supabase.from('users').update({
+        app_balance: Number(referrer.app_balance || 0) + bonus,
+        updated_at: iso,
+      }).eq('id', user.referrer_id);
+      await supabase.from('referral_earnings').insert({
+        user_id: user.referrer_id,
+        from_user_id: userId,
+        amount: bonus,
+      });
+    }).catch(e => console.error('ref bonus error', e));
   }
 
   return { claimed: pending, newBalance };
@@ -298,10 +280,7 @@ export async function connectWallet(userId, walletAddress) {
 
   const { data, error } = await supabase
     .from('users')
-    .update({
-      wallet_address: walletAddress,
-      updated_at: new Date().toISOString(),
-    })
+    .update({ wallet_address: walletAddress, updated_at: new Date().toISOString() })
     .eq('id', userId)
     .select('*')
     .single();
@@ -309,13 +288,9 @@ export async function connectWallet(userId, walletAddress) {
   if (error) throw error;
 
   const hold = await fetchBtxBalance(walletAddress);
-
   const { data: updated, error: holdErr } = await supabase
     .from('users')
-    .update({
-      wallet_hold: hold,
-      updated_at: new Date().toISOString(),
-    })
+    .update({ wallet_hold: hold, updated_at: new Date().toISOString() })
     .eq('id', userId)
     .select('*')
     .single();
@@ -324,7 +299,6 @@ export async function connectWallet(userId, walletAddress) {
     console.error('set hold error:', holdErr);
     return data;
   }
-
   return updated;
 }
 
@@ -335,10 +309,7 @@ export async function setWalletHold(userId, hold) {
 
   const { data, error } = await supabase
     .from('users')
-    .update({
-      wallet_hold: value,
-      updated_at: new Date().toISOString(),
-    })
+    .update({ wallet_hold: value, updated_at: new Date().toISOString() })
     .eq('id', userId)
     .select('*')
     .single();
@@ -346,6 +317,89 @@ export async function setWalletHold(userId, hold) {
   if (error) throw error;
   return data;
 }
+
+// ==================== DAILY STREAK ====================
+
+export function getStreakInfo(user) {
+  const today = getTodayDateString();
+  const yesterday = getYesterdayDateString();
+  const lastDate = user.last_streak_date;
+  let streak = Number(user.streak_count || 0);
+
+  // Если уже собирал сегодня
+  const claimedToday = lastDate === today;
+
+  // Если пропустил день — серия сбрасывается
+  if (lastDate && lastDate !== today && lastDate !== yesterday) {
+    streak = 0;
+  }
+
+  const nextDay = claimedToday ? streak + 1 : streak + 1;
+  const rewardIndex = Math.min(nextDay - 1, STREAK_REWARDS.length - 1);
+  const reward = STREAK_REWARDS[rewardIndex] || STREAK_REWARDS[STREAK_REWARDS.length - 1];
+
+  return {
+    streak_count: streak,
+    claimed_today: claimedToday,
+    next_reward: reward,
+    next_day: nextDay > 30 ? 1 : nextDay,
+    total_claimed: Number(user.total_streak_claimed || 0),
+    rewards: STREAK_REWARDS,
+  };
+}
+
+export async function claimStreak(userId) {
+  const user = await getUser(userId);
+  if (!user) throw new Error('User not found');
+
+  const today = getTodayDateString();
+  const yesterday = getYesterdayDateString();
+  const lastDate = user.last_streak_date;
+  let streak = Number(user.streak_count || 0);
+
+  if (lastDate === today) {
+    throw new Error('Вы уже получили награду сегодня');
+  }
+
+  // Проверяем непрерывность
+  if (lastDate === yesterday) {
+    streak += 1;
+  } else {
+    streak = 1; // начинаем заново
+  }
+
+  // Ограничиваем 30 днями (потом начинается новый круг)
+  if (streak > 30) streak = 1;
+
+  const rewardIndex = Math.min(streak - 1, STREAK_REWARDS.length - 1);
+  const reward = STREAK_REWARDS[rewardIndex];
+
+  const newBalance = Number(user.app_balance || 0) + reward;
+
+  const { data, error } = await supabase
+    .from('users')
+    .update({
+      streak_count: streak,
+      last_streak_date: today,
+      app_balance: newBalance,
+      total_streak_claimed: Number(user.total_streak_claimed || 0) + reward,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', userId)
+    .select('*')
+    .single();
+
+  if (error) throw error;
+
+  return {
+    success: true,
+    reward,
+    new_streak: streak,
+    new_balance: newBalance,
+  };
+}
+
+// ==================== WITHDRAWALS ====================
 
 export async function createWithdrawRequest(userId, amount) {
   const amt = Number(amount);
@@ -382,10 +436,7 @@ export async function createWithdrawRequest(userId, amount) {
 
   const { error: balErr } = await supabase
     .from('users')
-    .update({
-      app_balance: balance - amt,
-      updated_at: new Date().toISOString(),
-    })
+    .update({ app_balance: balance - amt, updated_at: new Date().toISOString() })
     .eq('id', userId);
 
   if (balErr) throw balErr;
@@ -404,10 +455,7 @@ export async function createWithdrawRequest(userId, amount) {
     .single();
 
   if (error) {
-    await supabase
-      .from('users')
-      .update({ app_balance: balance })
-      .eq('id', userId);
+    await supabase.from('users').update({ app_balance: balance }).eq('id', userId);
     throw error;
   }
 
@@ -421,12 +469,9 @@ export async function getWithdrawals(userId) {
     .eq('user_id', userId)
     .order('created_at', { ascending: false })
     .limit(20);
-
   if (error) throw error;
   return data || [];
 }
-
-// ===== АДМИН ФУНКЦИИ =====
 
 export async function getPendingWithdrawals() {
   const { data, error } = await supabase
@@ -434,7 +479,6 @@ export async function getPendingWithdrawals() {
     .select('*, users(id, username, first_name)')
     .eq('status', 'pending')
     .order('created_at', { ascending: true });
-
   if (error) throw error;
   return data || [];
 }
@@ -447,13 +491,11 @@ export async function markWithdrawalPaid(id) {
     .eq('status', 'pending')
     .select('*')
     .single();
-
   if (error) throw error;
   return data;
 }
 
 export async function rejectWithdrawal(id) {
-  // Получаем заявку
   const { data: w, error: findErr } = await supabase
     .from('withdrawals')
     .select('*')
@@ -463,7 +505,6 @@ export async function rejectWithdrawal(id) {
 
   if (findErr || !w) throw new Error('Заявка не найдена или уже обработана');
 
-  // Возвращаем баланс
   const { data: user } = await supabase
     .from('users')
     .select('app_balance')
@@ -480,7 +521,6 @@ export async function rejectWithdrawal(id) {
       .eq('id', w.user_id);
   }
 
-  // Меняем статус
   const { data, error } = await supabase
     .from('withdrawals')
     .update({ status: 'rejected', updated_at: new Date().toISOString() })
