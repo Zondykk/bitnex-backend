@@ -1,19 +1,17 @@
 import express from 'express';
 import cors from 'cors';
-import { getUser, claimRewards, getReferralStats, upsertUser } from './users.js';
+import { getUser, claimRewards, getReferralStats, upsertUser, getLevels } from './users.js';
 
 export function createApi() {
   const app = express();
   app.use(cors());
   app.use(express.json());
 
-  // Проверка, что сервер жив
   app.get('/', (req, res) => {
     res.json({ status: 'ok', service: 'BitneX API' });
   });
 
-  // Получить данные пользователя
-  // GET /api/user/:id
+  // Получить пользователя (с доначислением майнинга)
   app.get('/api/user/:id', async (req, res) => {
     try {
       const id = Number(req.params.id);
@@ -23,17 +21,27 @@ export function createApi() {
       if (!user) return res.status(404).json({ error: 'User not found' });
 
       const refs = await getReferralStats(id);
+      const levels = getLevels();
+      const hold = Number(user.wallet_hold) || 0;
+      let current = levels[0];
+      for (const l of levels) {
+        if (hold >= l.hold) current = l;
+      }
 
       res.json({
         id: user.id,
         username: user.username,
         first_name: user.first_name,
         ref_code: user.ref_code,
-        app_balance: Number(user.app_balance),
-        pending: Number(user.pending),
-        total_claimed: Number(user.total_claimed),
-        wallet_hold: Number(user.wallet_hold),
+        app_balance: Number(user.app_balance) || 0,
+        pending: Number(user.pending) || 0,
+        total_claimed: Number(user.total_claimed) || 0,
+        wallet_hold: hold,
         referrer_id: user.referrer_id,
+        last_mining_at: user.last_mining_at,
+        level: current.level,
+        rate: current.rate,
+        boost: current.boost,
         referrals: {
           count: refs.count,
           earned: refs.earned,
@@ -41,13 +49,11 @@ export function createApi() {
       });
     } catch (err) {
       console.error(err);
-      res.status(500).json({ error: 'Server error' });
+      res.status(500).json({ error: 'Server error', details: err.message });
     }
   });
 
-  // Собрать награды
-  // POST /api/claim
-  // body: { user_id: number }
+  // Claim
   app.post('/api/claim', async (req, res) => {
     try {
       const { user_id } = req.body;
@@ -61,9 +67,7 @@ export function createApi() {
     }
   });
 
-  // Регистрация / обновление пользователя из Mini App
-  // POST /api/register
-  // body: { id, username, first_name, last_name, start_param }
+  // Регистрация / логин из Mini App
   app.post('/api/register', async (req, res) => {
     try {
       const { id, username, first_name, last_name, start_param } = req.body;
@@ -75,13 +79,24 @@ export function createApi() {
       );
 
       const refs = await getReferralStats(user.id);
+      const levels = getLevels();
+      const hold = Number(user.wallet_hold) || 0;
+      let current = levels[0];
+      for (const l of levels) {
+        if (hold >= l.hold) current = l;
+      }
 
       res.json({
         id: user.id,
         ref_code: user.ref_code,
-        app_balance: Number(user.app_balance),
-        pending: Number(user.pending),
-        wallet_hold: Number(user.wallet_hold),
+        app_balance: Number(user.app_balance) || 0,
+        pending: Number(user.pending) || 0,
+        total_claimed: Number(user.total_claimed) || 0,
+        wallet_hold: hold,
+        last_mining_at: user.last_mining_at,
+        level: current.level,
+        rate: current.rate,
+        boost: current.boost,
         referrals: {
           count: refs.count,
           earned: refs.earned,
@@ -89,7 +104,7 @@ export function createApi() {
       });
     } catch (err) {
       console.error(err);
-      res.status(500).json({ error: 'Server error' });
+      res.status(500).json({ error: 'Server error', details: err.message });
     }
   });
 

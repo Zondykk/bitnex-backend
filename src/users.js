@@ -1,6 +1,5 @@
 import { supabase } from './supabase.js';
 
-// Таблица уровней (должна совпадать с фронтом)
 const LEVELS = [
   { level: 1, hold: 0,     rate: 20,  boost: 1.00 },
   { level: 2, hold: 150,   rate: 24,  boost: 1.20 },
@@ -15,28 +14,38 @@ const LEVELS = [
 function getLevelInfo(walletHold) {
   let lvl = LEVELS[0];
   for (const l of LEVELS) {
-    if (walletHold >= l.hold) lvl = l;
+    if (Number(walletHold) >= l.hold) lvl = l;
   }
   return lvl;
 }
 
 /**
- * Считает, сколько намайнилось с last_mining_at до сейчас
- * и обновляет pending + last_mining_at в базе.
+ * Серверный майнинг 24/7.
+ * Считает elapsed time с last_mining_at и доначисляет pending.
  */
 async function accrueMining(user) {
-  const now = new Date();
-  const last = user.last_mining_at ? new Date(user.last_mining_at) : new Date(user.created_at || now);
-  const seconds = Math.max(0, (now - last) / 1000);
+  if (!user || !user.id) return user;
 
-  if (seconds < 1) {
-    return user; // слишком мало времени прошло
+  const now = new Date();
+  let last;
+  if (user.last_mining_at) {
+    last = new Date(user.last_mining_at);
+  } else if (user.created_at) {
+    last = new Date(user.created_at);
+  } else {
+    last = now;
   }
 
-  const lvl = getLevelInfo(Number(user.wallet_hold) || 0);
-  // rate — BTX в час, переводим в секунды
+  const seconds = Math.max(0, (now.getTime() - last.getTime()) / 1000);
+
+  // Минимум 2 секунды, чтобы не спамить БД
+  if (seconds < 2) {
+    return user;
+  }
+
+  const lvl = getLevelInfo(user.wallet_hold);
   const earned = (lvl.rate / 3600) * seconds * lvl.boost;
-  const newPending = Number(user.pending) + earned;
+  const newPending = Number(user.pending || 0) + earned;
 
   const { data, error } = await supabase
     .from('users')
@@ -46,33 +55,42 @@ async function accrueMining(user) {
       updated_at: now.toISOString(),
     })
     .eq('id', user.id)
-    .select()
+    .select('*')
     .single();
 
   if (error) {
-    console.error('accrueMining error:', error);
-    return user;
+    console.error('accrueMining error:', error.message || error);
+    // Возвращаем хотя бы локально посчитанное, чтобы UI не врал
+    return {
+      ...user,
+      pending: newPending,
+      last_mining_at: now.toISOString(),
+    };
   }
+
   return data;
 }
 
-/**
- * Создаёт или обновляет пользователя.
- */
 export async function upsertUser(tgUser, startParam = null) {
   const id = tgUser.id;
   const refCode = String(id).slice(-9);
 
-  const { data: existing } = await supabase
+  const { data: existing, error: findErr } = await supabase
     .from('users')
     .select('*')
     .eq('id', id)
     .maybeSingle();
 
-  if (existing) {
-    // Начисляем майнинг перед возвратом
-    const accrued = await accrueMining(existing);
+  if (findErr) {
+    console.error('find user error:', findErr);
+    throw findErr;
+  }
 
+  if (existing) {
+    // 1) Доначисляем майнинг
+    let user = await accrueMining(existing);
+
+    // 2) Обновляем профиль (не трогаем pending)
     const { data, error } = await supabase
       .from('users')
       .update({
@@ -82,11 +100,20 @@ export async function upsertUser(tgUser, startParam = null) {
         updated_at: new Date().toISOString(),
       })
       .eq('id', id)
-      .select()
+      .select('*')
       .single();
 
-    if (error) throw error;
-    return data || accrued;
+    if (error) {
+      console.error('update profile error:', error);
+      return user;
+    }
+
+    // Берём pending из accrued (на случай если select вернул старое)
+    return {
+      ...data,
+      pending: user.pending,
+      last_mining_at: user.last_mining_at,
+    };
   }
 
   // Новый пользователь
@@ -95,7 +122,7 @@ export async function upsertUser(tgUser, startParam = null) {
     const { data: referrer } = await supabase
       .from('users')
       .select('id')
-      .eq('ref_code', startParam)
+      .eq('ref_code', String(startParam))
       .maybeSingle();
 
     if (referrer && referrer.id !== id) {
@@ -120,16 +147,16 @@ export async function upsertUser(tgUser, startParam = null) {
       wallet_hold: 0,
       last_mining_at: now,
     })
-    .select()
+    .select('*')
     .single();
 
-  if (error) throw error;
+  if (error) {
+    console.error('insert user error:', error);
+    throw error;
+  }
   return data;
 }
 
-/**
- * Получить пользователя + начислить майнинг
- */
 export async function getUser(id) {
   const { data, error } = await supabase
     .from('users')
@@ -140,13 +167,9 @@ export async function getUser(id) {
   if (error) throw error;
   if (!data) return null;
 
-  // Начисляем всё, что намайнилось пока приложение было закрыто
   return await accrueMining(data);
 }
 
-/**
- * Статистика рефералов
- */
 export async function getReferralStats(userId) {
   const { count } = await supabase
     .from('users')
@@ -166,20 +189,17 @@ export async function getReferralStats(userId) {
   };
 }
 
-/**
- * Собрать награды
- */
 export async function claimRewards(userId) {
-  // Сначала доначисляем всё актуальное
+  // Сначала доначисляем всё, что намайнилось
   let user = await getUser(userId);
   if (!user) throw new Error('User not found');
 
-  const pending = Number(user.pending);
+  const pending = Number(user.pending) || 0;
   if (pending < 0.0001) {
-    return { claimed: 0, newBalance: Number(user.app_balance) };
+    return { claimed: 0, newBalance: Number(user.app_balance) || 0 };
   }
 
-  const newBalance = Number(user.app_balance) + pending;
+  const newBalance = Number(user.app_balance || 0) + pending;
   const now = new Date().toISOString();
 
   const { error } = await supabase
@@ -187,7 +207,7 @@ export async function claimRewards(userId) {
     .update({
       app_balance: newBalance,
       pending: 0,
-      total_claimed: Number(user.total_claimed) + pending,
+      total_claimed: Number(user.total_claimed || 0) + pending,
       last_mining_at: now,
       updated_at: now,
     })
@@ -203,13 +223,13 @@ export async function claimRewards(userId) {
       .from('users')
       .select('app_balance')
       .eq('id', user.referrer_id)
-      .single();
+      .maybeSingle();
 
     if (referrer) {
       await supabase
         .from('users')
         .update({
-          app_balance: Number(referrer.app_balance) + bonus,
+          app_balance: Number(referrer.app_balance || 0) + bonus,
           updated_at: now,
         })
         .eq('id', user.referrer_id);
@@ -223,4 +243,8 @@ export async function claimRewards(userId) {
   }
 
   return { claimed: pending, newBalance };
+}
+
+export function getLevels() {
+  return LEVELS;
 }
